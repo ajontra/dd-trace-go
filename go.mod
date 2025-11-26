@@ -108,3 +108,7 @@ retract (
 	[v2.0.0-beta.1, v2.0.0-beta.11]
 	v2.0.0-20240516153256-8d6fa2bea61d
 )
+
+replace github.com/DataDog/dd-trace-go/v2 => github.com/ajontra/dd-trace-go/v2 v2.4.0
+
+replace github.com/DataDog/dd-trace-go/contrib/99designs/gqlgen/v2 => github.com/ajontra/dd-trace-go/contrib/99designs/gqlgen/v2 v2.4.0-rc.6.0.20251114151731-e072bec76476
