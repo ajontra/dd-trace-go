@@ -117,8 +117,8 @@ func ensureSettingsInitialization(serviceName string) {
 
 		// check if we need to disable EFD because known tests is not enabled
 		if !ciSettings.KnownTestsEnabled {
-			// "known_tests_enabled" parameter works as a kill-switch for EFD, so if “known_tests_enabled” is false it
-			// will disable EFD even if “early_flake_detection.enabled” is set to true (which should not happen normally,
+			// "known_tests_enabled" parameter works as a kill-switch for EFD, so if "known_tests_enabled" is false it
+			// will disable EFD even if "early_flake_detection.enabled" is set to true (which should not happen normally,
 			// the backend should disable both of them in that case)
 			ciSettings.EarlyFlakeDetection.Enabled = false
 		}
@@ -227,9 +227,15 @@ func ensureAdditionalFeaturesInitialization(_ string) {
 				ciEfdData, err := ciVisibilityClient.GetKnownTests()
 				if err != nil {
 					log.Error("civisibility: error getting CI visibility known tests data: %s", err.Error())
+					// Initialize to empty struct to ensure the variable is always set
+					// and prevent potential nil pointer dereferences or blocking behavior
+					ciVisibilityKnownTests = net.KnownTestsResponseData{}
 				} else if ciEfdData != nil {
 					ciVisibilityKnownTests = *ciEfdData
 					log.Debug("civisibility: known tests data loaded.")
+				} else {
+					// Handle case where no error occurred but response is nil
+					ciVisibilityKnownTests = net.KnownTestsResponseData{}
 				}
 			}()
 		}
@@ -243,10 +249,17 @@ func ensureAdditionalFeaturesInitialization(_ string) {
 				correlationID, skippableTests, err := ciVisibilityClient.GetSkippableTests()
 				if err != nil {
 					log.Error("civisibility: error getting CI visibility skippable tests: %s", err.Error())
+					// Initialize to empty map to ensure the variable is always set and prevent
+					// potential nil pointer dereferences or blocking behavior in code that accesses
+					// this variable. This allows graceful degradation when the API call fails.
+					ciVisibilitySkippables = make(map[string]map[string][]net.SkippableResponseDataAttributes)
 				} else if skippableTests != nil {
 					log.Debug("civisibility: skippable tests loaded: %d suites", len(skippableTests))
 					setAdditionalTags(constants.ItrCorrelationIDTag, correlationID)
 					ciVisibilitySkippables = skippableTests
+				} else {
+					// Handle case where no error occurred but response is nil
+					ciVisibilitySkippables = make(map[string]map[string][]net.SkippableResponseDataAttributes)
 				}
 			}()
 		}
@@ -259,14 +272,20 @@ func ensureAdditionalFeaturesInitialization(_ string) {
 				testManagementTests, err := ciVisibilityClient.GetTestManagementTests()
 				if err != nil {
 					log.Error("civisibility: error getting CI visibility test management tests: %s", err.Error())
+					// Initialize to empty struct to ensure the variable is always set
+					// and prevent potential nil pointer dereferences or blocking behavior
+					ciVisibilityTestManagementTests = net.TestManagementTestsResponseDataModules{}
 				} else if testManagementTests != nil {
 					ciVisibilityTestManagementTests = *testManagementTests
 					log.Debug("civisibility: test management loaded [attemptToFixRetries: %d]", currentSettings.TestManagement.AttemptToFixRetries)
+				} else {
+					// Handle case where no error occurred but response is nil
+					ciVisibilityTestManagementTests = net.TestManagementTestsResponseDataModules{}
 				}
 			}()
 		}
 
-		// if wheter the settings response or the env var is true we load the impacted tests analyzer
+		// if whether the settings response or the env var is true we load the impacted tests analyzer
 		if currentSettings.ImpactedTestsEnabled {
 			wg.Add(1)
 			go func() {
@@ -274,6 +293,9 @@ func ensureAdditionalFeaturesInitialization(_ string) {
 				iTests, err := impactedtests.NewImpactedTestAnalyzer()
 				if err != nil {
 					log.Error("civisibility: error getting CI visibility impacted tests analyzer: %s", err.Error())
+					// Explicitly set to nil on error. Since this is already a pointer type,
+					// nil is the appropriate zero value indicating no analyzer is available.
+					ciVisibilityImpactedTestsAnalyzer = nil
 				} else {
 					ciVisibilityImpactedTestsAnalyzer = iTests
 					log.Debug("civisibility: impacted tests analyzer loaded")
