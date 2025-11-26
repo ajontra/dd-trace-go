@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/DataDog/dd-trace-go/v2/internal"
 	"github.com/DataDog/dd-trace-go/v2/internal/civisibility/constants"
@@ -22,6 +23,8 @@ import (
 const (
 	DefaultFlakyRetryCount      = 5
 	DefaultFlakyTotalRetryCount = 1_000
+	// uploadTimeout is the maximum time to wait for git upload operations
+	uploadTimeout = 5 * time.Minute
 )
 
 type (
@@ -81,15 +84,27 @@ func ensureSettingsInitialization(serviceName string) {
 		}
 
 		// upload the repository changes
-		var uploadChannel = make(chan struct{})
+		var uploadChannel = make(chan struct{}, 1) // buffered to prevent goroutine leak
 		go func() {
+			defer func() {
+				// Ensure we always signal completion, even if there's a panic
+				if r := recover(); r != nil {
+					log.Error("civisibility: panic during repository upload: %v", r)
+				}
+				// Always send to channel, even on error/panic
+				select {
+				case uploadChannel <- struct{}{}:
+				default:
+					// Channel already has a value, don't block
+				}
+			}()
+
 			bytes, err := uploadRepositoryChanges()
 			if err != nil {
 				log.Error("civisibility: error uploading repository changes: %s", err.Error())
 			} else {
 				log.Debug("civisibility: uploaded %d bytes in pack files", bytes)
 			}
-			uploadChannel <- struct{}{}
 		}()
 
 		// Get the CI Visibility settings payload for this test session
@@ -98,8 +113,14 @@ func ensureSettingsInitialization(serviceName string) {
 			log.Error("civisibility: error getting CI visibility settings: %s", err.Error())
 			log.Debug("civisibility: no need to wait for the git upload to finish")
 			// Enqueue a close action to wait for the upload to finish before finishing the process
+			// with a timeout to prevent indefinite hanging
 			PushCiVisibilityCloseAction(func() {
-				<-uploadChannel
+				select {
+				case <-uploadChannel:
+					log.Debug("civisibility: git upload completed during cleanup")
+				case <-time.After(uploadTimeout):
+					log.Warn("civisibility: timeout waiting for git upload to complete during cleanup")
+				}
 			})
 			return
 		}
@@ -107,7 +128,14 @@ func ensureSettingsInitialization(serviceName string) {
 		// check if we need to wait for the upload to finish and repeat the settings request or we can just continue
 		if ciSettings.RequireGit {
 			log.Debug("civisibility: waiting for the git upload to finish and repeating the settings request")
-			<-uploadChannel
+			select {
+			case <-uploadChannel:
+				log.Debug("civisibility: git upload completed")
+			case <-time.After(uploadTimeout):
+				log.Error("civisibility: timeout waiting for git upload to complete")
+				return
+			}
+
 			ciSettings, err = ciVisibilityClient.GetSettings()
 			if err != nil {
 				log.Error("civisibility: error getting CI visibility settings: %s", err.Error())
@@ -117,8 +145,8 @@ func ensureSettingsInitialization(serviceName string) {
 
 		// check if we need to disable EFD because known tests is not enabled
 		if !ciSettings.KnownTestsEnabled {
-			// "known_tests_enabled" parameter works as a kill-switch for EFD, so if “known_tests_enabled” is false it
-			// will disable EFD even if “early_flake_detection.enabled” is set to true (which should not happen normally,
+			// "known_tests_enabled" parameter works as a kill-switch for EFD, so if "known_tests_enabled" is false it
+			// will disable EFD even if "early_flake_detection.enabled" is set to true (which should not happen normally,
 			// the backend should disable both of them in that case)
 			ciSettings.EarlyFlakeDetection.Enabled = false
 		}
@@ -147,22 +175,27 @@ func ensureSettingsInitialization(serviceName string) {
 			ciSettings.TestManagement.AttemptToFixRetries = testManagementAttemptToFixRetriesEnv
 		}
 
-		// determine if subtest-specific features are enabled via environment variables
-		subtestFeaturesEnabled := internal.BoolEnv(constants.CIVisibilitySubtestFeaturesEnabled, true)
-		if !subtestFeaturesEnabled {
-			log.Debug("civisibility: subtest test management features disabled by environment variable")
-		}
-		ciSettings.SubtestFeaturesEnabled = subtestFeaturesEnabled
-
 		// check if we need to wait for the upload to finish before continuing
 		if ciSettings.ImpactedTestsEnabled {
 			log.Debug("civisibility: impacted tests is enabled we need to wait for the upload to finish (for the unshallow process)")
-			<-uploadChannel
+			select {
+			case <-uploadChannel:
+				log.Debug("civisibility: git upload completed for impacted tests")
+			case <-time.After(uploadTimeout):
+				log.Error("civisibility: timeout waiting for git upload to complete for impacted tests")
+				return
+			}
 		} else {
 			log.Debug("civisibility: no need to wait for the git upload to finish")
 			// Enqueue a close action to wait for the upload to finish before finishing the process
+			// with a timeout to prevent indefinite hanging
 			PushCiVisibilityCloseAction(func() {
-				<-uploadChannel
+				select {
+				case <-uploadChannel:
+					log.Debug("civisibility: git upload completed during cleanup")
+				case <-time.After(uploadTimeout):
+					log.Warn("civisibility: timeout waiting for git upload to complete during cleanup")
+				}
 			})
 		}
 
@@ -234,9 +267,13 @@ func ensureAdditionalFeaturesInitialization(_ string) {
 				ciEfdData, err := ciVisibilityClient.GetKnownTests()
 				if err != nil {
 					log.Error("civisibility: error getting CI visibility known tests data: %s", err.Error())
+					// Initialize to empty struct to ensure the variable is always set
+					ciVisibilityKnownTests = net.KnownTestsResponseData{}
 				} else if ciEfdData != nil {
 					ciVisibilityKnownTests = *ciEfdData
 					log.Debug("civisibility: known tests data loaded.")
+				} else {
+					ciVisibilityKnownTests = net.KnownTestsResponseData{}
 				}
 			}()
 		}
@@ -250,10 +287,15 @@ func ensureAdditionalFeaturesInitialization(_ string) {
 				correlationID, skippableTests, err := ciVisibilityClient.GetSkippableTests()
 				if err != nil {
 					log.Error("civisibility: error getting CI visibility skippable tests: %s", err.Error())
+					// Initialize to empty map to ensure the variable is always set and prevent
+					// potential nil pointer dereferences or blocking behavior
+					ciVisibilitySkippables = make(map[string]map[string][]net.SkippableResponseDataAttributes)
 				} else if skippableTests != nil {
 					log.Debug("civisibility: skippable tests loaded: %d suites", len(skippableTests))
 					setAdditionalTags(constants.ItrCorrelationIDTag, correlationID)
 					ciVisibilitySkippables = skippableTests
+				} else {
+					ciVisibilitySkippables = make(map[string]map[string][]net.SkippableResponseDataAttributes)
 				}
 			}()
 		}
@@ -266,14 +308,18 @@ func ensureAdditionalFeaturesInitialization(_ string) {
 				testManagementTests, err := ciVisibilityClient.GetTestManagementTests()
 				if err != nil {
 					log.Error("civisibility: error getting CI visibility test management tests: %s", err.Error())
+					// Initialize to empty struct to ensure the variable is always set
+					ciVisibilityTestManagementTests = net.TestManagementTestsResponseDataModules{}
 				} else if testManagementTests != nil {
 					ciVisibilityTestManagementTests = *testManagementTests
 					log.Debug("civisibility: test management loaded [attemptToFixRetries: %d]", currentSettings.TestManagement.AttemptToFixRetries)
+				} else {
+					ciVisibilityTestManagementTests = net.TestManagementTestsResponseDataModules{}
 				}
 			}()
 		}
 
-		// if wheter the settings response or the env var is true we load the impacted tests analyzer
+		// if whether the settings response or the env var is true we load the impacted tests analyzer
 		if currentSettings.ImpactedTestsEnabled {
 			wg.Add(1)
 			go func() {
@@ -281,6 +327,8 @@ func ensureAdditionalFeaturesInitialization(_ string) {
 				iTests, err := impactedtests.NewImpactedTestAnalyzer()
 				if err != nil {
 					log.Error("civisibility: error getting CI visibility impacted tests analyzer: %s", err.Error())
+					// Explicitly set to nil on error
+					ciVisibilityImpactedTestsAnalyzer = nil
 				} else {
 					ciVisibilityImpactedTestsAnalyzer = iTests
 					log.Debug("civisibility: impacted tests analyzer loaded")
